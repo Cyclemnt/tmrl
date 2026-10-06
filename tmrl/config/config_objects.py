@@ -2,6 +2,8 @@
 # from tmrl.custom.custom_checkpoints import load_run_instance_images_dataset, dump_run_instance_images_dataset
 # third-party imports
 
+import os
+
 import rtgym
 
 # local imports
@@ -12,15 +14,81 @@ from tmrl.custom.custom_memories import MemoryTMFull, MemoryTMLidar, MemoryTMLid
 from tmrl.custom.tm.tm_preprocessors import obs_preprocessor_tm_act_in_obs, obs_preprocessor_tm_lidar_act_in_obs, obs_preprocessor_tm_lidar_progress_act_in_obs
 from tmrl.envs import GenericGymEnv
 from tmrl.custom.custom_models import SquashedGaussianMLPActor, MLPActorCritic, REDQMLPActorCritic, RNNActorCritic, SquashedGaussianRNNActor, SquashedGaussianVanillaCNNActor, VanillaCNNActorCritic, SquashedGaussianVanillaColorCNNActor, VanillaColorCNNActorCritic
+from tmrl.custom.custom_models import LateFusionActorCritic, SquashedGaussianLateFusionActor
 from tmrl.custom.custom_algorithms import SpinupSacAgent as SAC_Agent
 from tmrl.custom.custom_algorithms import REDQSACAgent as REDQ_Agent
 from tmrl.custom.custom_checkpoints import update_run_instance
+from tmrl.custom.benchmark_logger import EpisodeRecorder
 from tmrl.util import partial
 
 
 ALG_CONFIG = cfg.TMRL_CONFIG["ALG"]
 ALG_NAME = ALG_CONFIG["ALGORITHM"]
 assert ALG_NAME in ["SAC", "REDQSAC"], f"If you wish to implement {ALG_NAME}, do not use 'ALG' in config.json for that."
+
+
+# CHOIX DU RÉSEAU (LIDAR + PROGRESS) : ===========================
+# >>> UNE SEULE LIGNE À MODIFIER pour comparer les réseaux <<<
+#   "mlp"        : baseline TMRL (SquashedGaussianMLPActor)
+#   "latefusion" : CNN 1D (lidar) + MLP (scalaires), fusion tardive  (voir custom_models.py)
+# Pense à changer AUSSI "RUN_NAME" dans TmrlData/config/config.json (un nom par réseau) : TMRL s'en sert pour nommer
+# les poids / checkpoints, et le logger s'en sert comme étiquette de run. Sinon deux réseaux écraseront les mêmes fichiers.
+MODEL_NAME = "latefusion"
+MODELS_LIDAR_PROGRESS = {
+    "mlp": (MLPActorCritic if ALG_NAME == "SAC" else REDQMLPActorCritic, SquashedGaussianMLPActor),
+    "latefusion": (LateFusionActorCritic, SquashedGaussianLateFusionActor),
+}
+
+# Étiquettes du logger CSV. Phase : "train" (par défaut) ou "eval" -> avant de lancer le worker d'évaluation :
+#   PowerShell :  $env:TMRL_LOG_PHASE = "eval"
+LOG_RUN_NAME = str(getattr(cfg, "RUN_NAME", MODEL_NAME))
+LOG_PHASE = os.environ.get("TMRL_LOG_PHASE", "train")
+print(f"[CONFIG] MODEL_NAME={MODEL_NAME} | RUN_NAME={LOG_RUN_NAME} | LOG_PHASE={LOG_PHASE}", flush=True)
+
+
+# LOGGER CSV (steps.csv + episodes.csv dans TmrlData/benchmark) : =====================
+# On accroche le log à l'INTERFACE TrackMania (celle qui lit le jeu), car c'est elle que le worker utilise à coup sûr.
+# (Une sous-classe de GenericGymEnv n'est pas forcément celle que le worker instancie : c'est ce qui donnait un CSV vide.)
+# send_control() mémorise l'action envoyée ; get_obs_rew_terminated_info() renvoie obs / reward / terminated -> 1 ligne CSV.
+
+class LoggingInterfaceMixin:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._recorder = EpisodeRecorder(
+            folder=os.path.join(str(cfg.TMRL_FOLDER), "benchmark"),
+            run_name=LOG_RUN_NAME,
+            phase=LOG_PHASE,
+            time_step=cfg.ENV_CONFIG["RTGYM_CONFIG"].get("time_step_duration", 0.05))
+        self._last_control = None
+        print(f"[LOGGER] interface avec log CSV instanciée (pid={os.getpid()})", flush=True)
+
+    def reset(self, *args, **kwargs):
+        self._recorder.on_reset()
+        return super().reset(*args, **kwargs)
+
+    def send_control(self, control):
+        self._last_control = control
+        return super().send_control(control)
+
+    def _log(self, res):
+        self._recorder.on_step(res[0], self._last_control, res[1], res[2], False)
+        return res
+
+    # selon la version de rtgym, la méthode s'appelle l'une ou l'autre (une seule est appelée)
+    def get_obs_rew_terminated_info(self):
+        return self._log(super().get_obs_rew_terminated_info())
+
+    def get_obs_rew_done_info(self):
+        return self._log(super().get_obs_rew_done_info())
+
+
+class LoggedInterfaceLidar(LoggingInterfaceMixin, TM2020InterfaceLidar):
+    pass
+
+
+class LoggedInterfaceLidarProgress(LoggingInterfaceMixin, TM2020InterfaceLidarProgress):
+    pass
+
 
 
 # MODEL, GYM ENVIRONMENT, REPLAY MEMORY AND TRAINING: ===========
@@ -30,6 +98,8 @@ if cfg.PRAGMA_LIDAR:
         assert ALG_NAME == "SAC", f"{ALG_NAME} is not implemented here."
         TRAIN_MODEL = RNNActorCritic
         POLICY = SquashedGaussianRNNActor
+    elif cfg.PRAGMA_PROGRESS:
+        TRAIN_MODEL, POLICY = MODELS_LIDAR_PROGRESS[MODEL_NAME]
     else:
         TRAIN_MODEL = MLPActorCritic if ALG_NAME == "SAC" else REDQMLPActorCritic
         POLICY = SquashedGaussianMLPActor
@@ -41,9 +111,9 @@ else:
 
 if cfg.PRAGMA_LIDAR:
     if cfg.PRAGMA_PROGRESS:
-        INT = partial(TM2020InterfaceLidarProgress, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
+        INT = partial(LoggedInterfaceLidarProgress, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
     else:
-        INT = partial(TM2020InterfaceLidar, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
+        INT = partial(LoggedInterfaceLidar, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
 else:
     INT = partial(TM2020Interface,
                   img_hist_len=cfg.IMG_HIST_LEN,
