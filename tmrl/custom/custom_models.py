@@ -837,11 +837,22 @@ class SquashedGaussianLateFusionActor(TorchActorModule):
         self.rays = 19  # 19 rayons
         n_scalars = 2 + cfg.ACT_BUF_LEN * dim_act  # speed, progress, actions passées
         self.lidar_net = nn.Sequential(
-            nn.Conv1d(self.hist, 16, 3, padding=1), nn.ReLU(),
-            nn.Conv1d(16, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv1d(self.hist, 16, 3, padding=1), 
+            nn.ReLU(),
+            nn.Conv1d(16, 32, 3, padding=1), 
+            nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(32 * self.rays, 64), nn.ReLU())
-        self.scalar_net = mlp([n_scalars, 64], nn.ReLU, nn.ReLU)
+            nn.Linear(32 * self.rays, 64),
+            nn.LayerNorm(64),
+            nn.ReLU()
+        )
+        self.scalar_net = nn.Sequential(
+            nn.Linear(n_scalars, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
         self.net = mlp([64 + 64] + list(hidden_sizes), activation, activation)
         self.mu_layer = nn.Linear(hidden_sizes[-1], dim_act)
         self.log_std_layer = nn.Linear(hidden_sizes[-1], dim_act)
@@ -891,11 +902,22 @@ class LateFusionQFunction(nn.Module):
         self.rays = 19
         n_scalars = 2 + cfg.ACT_BUF_LEN * dim_act + dim_act
         self.lidar_net = nn.Sequential(
-            nn.Conv1d(self.hist, 16, 3, padding=1), nn.ReLU(),
-            nn.Conv1d(16, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv1d(self.hist, 16, 3, padding=1), 
+            nn.ReLU(),
+            nn.Conv1d(16, 32, 3, padding=1), 
+            nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(32 * self.rays, 64), nn.ReLU())
-        self.scalar_net = mlp([n_scalars, 64], nn.ReLU, nn.ReLU)
+            nn.Linear(32 * self.rays, 64),
+            nn.LayerNorm(64),
+            nn.ReLU()
+        )
+        self.scalar_net = nn.Sequential(
+            nn.Linear(n_scalars, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
         self.q = mlp([64 + 64] + list(hidden_sizes) + [1], activation)
  
     def forward(self, obs, act):
