@@ -861,7 +861,7 @@ class SquashedGaussianLateFusionActor(TorchActorModule):
     def forward(self, obs, test=False, with_logprob=True):
         speed, progress, lidar, *prev_actions = obs
         lidar = lidar.reshape(-1, self.hist, self.rays)
-        scalars = torch.cat((speed, progress, *prev_actions), -1)
+        scalars = torch.cat((speed / 100.0, progress, *prev_actions), -1)
         x = torch.cat((self.lidar_net(lidar), self.scalar_net(scalars)), -1)
         net_out = self.net(x)
         mu = self.mu_layer(net_out)
@@ -923,7 +923,7 @@ class LateFusionQFunction(nn.Module):
     def forward(self, obs, act):
         speed, progress, lidar, *prev_actions = obs
         lidar = lidar.reshape(-1, self.hist, self.rays)
-        scalars = torch.cat((speed, progress, *prev_actions, act), -1)
+        scalars = torch.cat((speed / 100.0, progress, *prev_actions, act), -1)
         x = torch.cat((self.lidar_net(lidar), self.scalar_net(scalars)), -1)
         q = self.q(x)
         return torch.squeeze(q, -1)  # Critical to ensure q has right shape.
