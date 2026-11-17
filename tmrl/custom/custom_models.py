@@ -828,18 +828,17 @@ class RNNActorCritic(nn.Module):
 
 # LATE FUSION : CNN 1D (lidar) + MLP (scalaires) ========================================================================
 
-class SquashedGaussianLateFusionActor(TorchActorModule):
-    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU):
-        super().__init__(observation_space, action_space)
-        dim_act = action_space.shape[0]
-        act_limit = action_space.high[0]
-        self.hist = cfg.IMG_HIST_LEN  # 4 frames
-        self.rays = 19  # 19 rayons
-        n_scalars = 2 + cfg.ACT_BUF_LEN * dim_act  # speed, progress, actions passées
+class LateFusionEncoder(nn.Module):
+    """Extracteur commun (architecture partagée, poids indépendants par instance)."""
+    def __init__(self, n_scalars, hist=None, rays=19):
+        super().__init__()
+        self.hist = hist if hist is not None else cfg.IMG_HIST_LEN
+        self.rays = rays
+
         self.lidar_net = nn.Sequential(
-            nn.Conv1d(self.hist, 16, 3, padding=1), 
+            nn.Conv1d(self.hist, 16, kernel_size=3, padding=1, padding_mode='replicate'),
             nn.ReLU(),
-            nn.Conv1d(16, 32, 3, padding=1), 
+            nn.Conv1d(16, 32, kernel_size=3, padding=1, padding_mode='replicate'),
             nn.ReLU(),
             nn.Flatten(),
             nn.Linear(32 * self.rays, 64),
@@ -853,38 +852,53 @@ class SquashedGaussianLateFusionActor(TorchActorModule):
             nn.Linear(64, 64),
             nn.ReLU()
         )
-        self.net = mlp([64 + 64] + list(hidden_sizes), activation, activation)
+
+    def forward(self, speed, progress, lidar, extra_scalars):
+        lidar = lidar.reshape(-1, self.hist, self.rays)
+        # Compression logarithmique : haute précision près des murs, bornée à ~1.0 à 300 m
+        lidar_norm = torch.log1p(torch.clamp(lidar, 0.0, 300.0)) / 5.7
+        scalars = torch.cat((speed / 100.0, progress, *extra_scalars), -1)
+        return torch.cat((self.lidar_net(lidar_norm), self.scalar_net(scalars)), -1)
+
+
+class SquashedGaussianLateFusionActor(TorchActorModule):
+    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU):
+        super().__init__(observation_space, action_space)
+        dim_act = action_space.shape[0]
+        act_limit = action_space.high[0]
+        n_scalars = 2 + cfg.ACT_BUF_LEN * dim_act  # speed, progress, actions passées
+
+        self.encoder = LateFusionEncoder(n_scalars=n_scalars)
+        self.net = mlp([128] + list(hidden_sizes), activation, activation)
         self.mu_layer = nn.Linear(hidden_sizes[-1], dim_act)
         self.log_std_layer = nn.Linear(hidden_sizes[-1], dim_act)
+
+        # Exploration initiale active (std ≈ 0.60) + biais d'accélération
+        nn.init.constant_(self.log_std_layer.bias, -0.5)
+        nn.init.constant_(self.mu_layer.bias[0], 1.0)
         self.act_limit = act_limit
- 
+        self._log_std_min = -3.5
+
     def forward(self, obs, test=False, with_logprob=True):
         speed, progress, lidar, *prev_actions = obs
-        lidar = lidar.reshape(-1, self.hist, self.rays)
-        scalars = torch.cat((speed / 100.0, progress, *prev_actions), -1)
-        x = torch.cat((self.lidar_net(lidar), self.scalar_net(scalars)), -1)
+        x = self.encoder(speed, progress, lidar, prev_actions)
         net_out = self.net(x)
         mu = self.mu_layer(net_out)
-        log_std = self.log_std_layer(net_out)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_std = torch.clamp(self.log_std_layer(net_out), self._log_std_min, LOG_STD_MAX)
         std = torch.exp(log_std)
- 
+
         pi_distribution = Normal(mu, std)
-        if test:
-            pi_action = mu
-        else:
-            pi_action = pi_distribution.rsample()
- 
+        pi_action = mu if test else pi_distribution.rsample()
+
         if with_logprob:
             logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
             logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
         else:
             logp_pi = None
- 
-        pi_action = torch.tanh(pi_action)
-        pi_action = self.act_limit * pi_action
+
+        pi_action = self.act_limit * torch.tanh(pi_action)
         return pi_action, logp_pi
- 
+
     def act(self, obs, test=False):
         with torch.no_grad():
             a, _ = self.forward(obs, test, False)
@@ -892,55 +906,42 @@ class SquashedGaussianLateFusionActor(TorchActorModule):
             if not len(res.shape):
                 res = np.expand_dims(res, 0)
             return res
- 
- 
+
+
 class LateFusionQFunction(nn.Module):
     def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU):
         super().__init__()
         dim_act = action_space.shape[0]
-        self.hist = cfg.IMG_HIST_LEN
-        self.rays = 19
-        n_scalars = 2 + cfg.ACT_BUF_LEN * dim_act + dim_act
-        self.lidar_net = nn.Sequential(
-            nn.Conv1d(self.hist, 16, 3, padding=1), 
-            nn.ReLU(),
-            nn.Conv1d(16, 32, 3, padding=1), 
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(32 * self.rays, 64),
-            nn.LayerNorm(64),
-            nn.ReLU()
-        )
-        self.scalar_net = nn.Sequential(
-            nn.Linear(n_scalars, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU()
-        )
-        self.q = mlp([64 + 64] + list(hidden_sizes) + [1], activation)
- 
+        n_scalars = 2 + cfg.ACT_BUF_LEN * dim_act + dim_act  # + action courante
+
+        self.encoder = LateFusionEncoder(n_scalars=n_scalars)
+        self.q = mlp([128] + list(hidden_sizes) + [1], activation)
+
     def forward(self, obs, act):
         speed, progress, lidar, *prev_actions = obs
-        lidar = lidar.reshape(-1, self.hist, self.rays)
-        scalars = torch.cat((speed / 100.0, progress, *prev_actions, act), -1)
-        x = torch.cat((self.lidar_net(lidar), self.scalar_net(scalars)), -1)
+        x = self.encoder(speed, progress, lidar, (*prev_actions, act))
         q = self.q(x)
-        return torch.squeeze(q, -1)  # Critical to ensure q has right shape.
- 
- 
+        return torch.squeeze(q, -1)
+
+
 class LateFusionActorCritic(nn.Module):
-    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU):
+    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU, n=None):
         super().__init__()
+        n_critics = n if n is not None else getattr(cfg, "REDQ_N", 2)
         self.actor = SquashedGaussianLateFusionActor(observation_space, action_space, hidden_sizes, activation)
-        self.q1 = LateFusionQFunction(observation_space, action_space, hidden_sizes, activation)
-        self.q2 = LateFusionQFunction(observation_space, action_space, hidden_sizes, activation)
- 
+        self.qs = nn.ModuleList([
+            LateFusionQFunction(observation_space, action_space, hidden_sizes, activation)
+            for _ in range(n_critics)
+        ])
+
+    @property
+    def q1(self):
+        return self.qs[0]
+
+    @property
+    def q2(self):
+        return self.qs[1] if len(self.qs) > 1 else self.qs[0]
+
     def act(self, obs, test=False):
-        with torch.no_grad():
-            a, _ = self.actor(obs, test, False)
-            res = a.squeeze().cpu().numpy()
-            if not len(res.shape):
-                res = np.expand_dims(res, 0)
-            return res
+        return self.actor.act(obs, test=test)
  
