@@ -15,6 +15,7 @@ from tmrl.custom.tm.tm_preprocessors import obs_preprocessor_tm_act_in_obs, obs_
 from tmrl.envs import GenericGymEnv
 from tmrl.custom.custom_models import SquashedGaussianMLPActor, MLPActorCritic, REDQMLPActorCritic, RNNActorCritic, SquashedGaussianRNNActor, SquashedGaussianVanillaCNNActor, VanillaCNNActorCritic, SquashedGaussianVanillaColorCNNActor, VanillaColorCNNActorCritic
 from tmrl.custom.custom_models import LateFusionActorCritic, SquashedGaussianLateFusionActor
+from tmrl.custom.custom_models import LidarFormerActorCritic, SquashedGaussianLidarFormerActor
 from tmrl.custom.custom_algorithms import SpinupSacAgent as SAC_Agent
 from tmrl.custom.custom_algorithms import REDQSACAgent as REDQ_Agent
 from tmrl.custom.custom_checkpoints import update_run_instance
@@ -28,22 +29,45 @@ assert ALG_NAME in ["SAC", "REDQSAC"], f"If you wish to implement {ALG_NAME}, do
 
 
 # CHOIX DU RÉSEAU (LIDAR + PROGRESS) : ===========================
-# >>> UNE SEULE LIGNE À MODIFIER pour comparer les réseaux <<<
 #   "mlp"        : baseline TMRL (SquashedGaussianMLPActor)
 #   "latefusion" : CNN 1D (lidar) + MLP (scalaires), fusion tardive  (voir custom_models.py)
-# Pense à changer AUSSI "RUN_NAME" dans TmrlData/config/config.json (un nom par réseau) : TMRL s'en sert pour nommer
-# les poids / checkpoints, et le logger s'en sert comme étiquette de run. Sinon deux réseaux écraseront les mêmes fichiers.
-MODEL_NAME = "latefusion"
+#   "lidarformer": Transformer sur l'historique lidar + MLP scalaires (voir custom_models.py)
+#
+# Le réseau se choisit soit en modifiant la ligne MODEL_NAME ci-dessous,
+# soit sans éditer ce fichier, avec la variable d'environnement TMRL_MODEL :
+#   PowerShell :  $env:TMRL_MODEL = "latefusion"
+#
+# Pense à changer AUSSI "RUN_NAME" dans TmrlData/config/config.json (un nom par réseau) :
+# TMRL s'en sert pour nommer les poids / checkpoints, et le logger s'en sert comme étiquette de run.
+# Sinon deux réseaux écraseront les mêmes fichiers.
+MODEL_NAME = os.environ.get("TMRL_MODEL", "lidarformer").strip().lower()
 MODELS_LIDAR_PROGRESS = {
     "mlp": (MLPActorCritic if ALG_NAME == "SAC" else REDQMLPActorCritic, SquashedGaussianMLPActor),
     "latefusion": (LateFusionActorCritic, SquashedGaussianLateFusionActor),
+    "lidarformer": (LidarFormerActorCritic, SquashedGaussianLidarFormerActor),
 }
+assert MODEL_NAME in MODELS_LIDAR_PROGRESS, \
+    f"MODEL_NAME={MODEL_NAME!r} inconnu ; choix possibles : {list(MODELS_LIDAR_PROGRESS)}"
+if cfg.PRAGMA_LIDAR and cfg.PRAGMA_PROGRESS:
+    assert ALG_NAME == "SAC" or MODEL_NAME == "mlp", \
+        f"MODEL_NAME={MODEL_NAME!r} n'est implémenté que pour SAC (ALGORITHM actuel : {ALG_NAME})."
+if MODEL_NAME in ("latefusion", "lidarformer") and not (cfg.PRAGMA_LIDAR and cfg.PRAGMA_PROGRESS):
+    print(f"[CONFIG][ATTENTION] MODEL_NAME={MODEL_NAME!r} nécessite "
+          f"RTGYM_INTERFACE=TM20LIDARPROGRESS (actuel : {cfg.RTGYM_INTERFACE!r}). "
+          "Le modèle personnalisé ne sera pas utilisé.", flush=True)
 
 # Étiquettes du logger CSV. Phase : "train" (par défaut) ou "eval" -> avant de lancer le worker d'évaluation :
 #   PowerShell :  $env:TMRL_LOG_PHASE = "eval"
 LOG_RUN_NAME = str(getattr(cfg, "RUN_NAME", MODEL_NAME))
 LOG_PHASE = os.environ.get("TMRL_LOG_PHASE", "train")
 print(f"[CONFIG] MODEL_NAME={MODEL_NAME} | RUN_NAME={LOG_RUN_NAME} | LOG_PHASE={LOG_PHASE}", flush=True)
+if cfg.PRAGMA_LIDAR and cfg.PRAGMA_PROGRESS and MODEL_NAME not in LOG_RUN_NAME.lower():
+    print(f"[CONFIG][ATTENTION] RUN_NAME={LOG_RUN_NAME!r} ne contient pas MODEL_NAME={MODEL_NAME!r} : "
+          "utilise un RUN_NAME unique par réseau pour ne pas écraser les poids/checkpoints.", flush=True)
+    if MODEL_NAME != "mlp" and os.path.isfile(cfg.MODEL_PATH_WORKER):
+        print(f"[CONFIG][ATTENTION] Des poids existent déjà pour ce RUN_NAME ({cfg.MODEL_PATH_WORKER}) : "
+              "ils risquent d'être incompatibles avec le nouveau réseau. "
+              "Choisis un RUN_NAME neuf (ex. SAC_LIDARPROGRESS_LidarFormer_v1).", flush=True)
 
 
 # LOGGER CSV (steps.csv + episodes.csv dans TmrlData/benchmark) : =====================

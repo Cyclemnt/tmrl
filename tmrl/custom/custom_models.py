@@ -943,4 +943,171 @@ class LateFusionActorCritic(nn.Module):
             if not len(res.shape):
                 res = np.expand_dims(res, 0)
             return res
+
+
+# LIDARFORMER : self-attention sur l'historique lidar + MLP scalaires ===================================================
+
+
+class LidarFormerEncoder(nn.Module):
+    """
+    Encode un historique de scans lidar avec un petit Transformer.
+
+    Chaque scan (vecteur de `rays` distances) est projeté en un token de
+    dimension `d_model`. Un encodage de position temporelle est ajouté, puis
+    plusieurs couches de self-attention mélangent l'information temporelle et
+    spatiale (rayons) avant un pooling temporel.
+    """
+
+    def __init__(self, hist, rays, d_model=64, nhead=4, num_layers=2, dim_feedforward=128, dropout=0.0):
+        super().__init__()
+        assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
+        self.hist = int(hist)
+        self.rays = int(rays)
+        self.input_proj = nn.Linear(self.rays, d_model)
+        self.pos_embedding = nn.Parameter(torch.zeros(1, self.hist, d_model))
+        nn.init.normal_(self.pos_embedding, mean=0.0, std=0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, lidar):
+        # Le preprocessor a aplati l'historique : (B, hist * rays)
+        x = lidar.reshape(-1, self.hist, self.rays)
+        x = self.input_proj(x) + self.pos_embedding
+        x = self.transformer(x)
+        x = x.mean(dim=1)  # pooling temporel
+        return self.norm(x)
+
+
+class LidarFormerScalarEncoder(nn.Module):
+    """Encode vitesse, progression et actions précédentes."""
+
+    def __init__(self, n_scalars, d_model=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_scalars, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def _lidarformer_dims(observation_space, dim_act):
+    """
+    Récupère (hist, rays, n_prev_actions) depuis l'espace d'observation.
+
+    L'interface retourne (speed, progress, imgs) et rtgym ajoute ensuite
+    `act_buf_len` espaces d'action à l'observation.
+    """
+    spaces = observation_space.spaces
+    assert len(spaces) >= 3, f"Unexpected observation space: {observation_space}"
+    hist, rays = spaces[2].shape
+    n_prev_actions = len(spaces) - 3
+    return int(hist), int(rays), int(n_prev_actions)
+
+
+class SquashedGaussianLidarFormerActor(TorchActorModule):
+    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU,
+                 d_model=64, nhead=4, num_layers=2, dim_feedforward=128, dropout=0.0):
+        super().__init__(observation_space, action_space)
+        dim_act = action_space.shape[0]
+        act_limit = action_space.high[0]
+        hist, rays, n_prev_actions = _lidarformer_dims(observation_space, dim_act)
+        n_scalars = 2 + n_prev_actions * dim_act  # speed, progress, actions passées
+        self.lidar_net = LidarFormerEncoder(hist, rays, d_model, nhead, num_layers, dim_feedforward, dropout)
+        self.scalar_net = LidarFormerScalarEncoder(n_scalars, d_model)
+        self.net = mlp([2 * d_model] + list(hidden_sizes), activation, activation)
+        self.mu_layer = nn.Linear(hidden_sizes[-1], dim_act)
+        self.log_std_layer = nn.Linear(hidden_sizes[-1], dim_act)
+        self.act_limit = act_limit
+
+    def forward(self, obs, test=False, with_logprob=True):
+        speed, progress, lidar, *prev_actions = obs
+        lidar = lidar.float()
+        scalars = torch.cat((speed.float() / 100.0, progress.float(), *[a.float() for a in prev_actions]), -1)
+        x = torch.cat((self.lidar_net(lidar), self.scalar_net(scalars)), -1)
+        net_out = self.net(x)
+        mu = self.mu_layer(net_out)
+        log_std = self.log_std_layer(net_out)
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        std = torch.exp(log_std)
+
+        pi_distribution = Normal(mu, std)
+        if test:
+            pi_action = mu
+        else:
+            pi_action = pi_distribution.rsample()
+
+        if with_logprob:
+            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
+            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+        else:
+            logp_pi = None
+
+        pi_action = torch.tanh(pi_action)
+        pi_action = self.act_limit * pi_action
+        return pi_action, logp_pi
+
+    def act(self, obs, test=False):
+        with torch.no_grad():
+            a, _ = self.forward(obs, test, False)
+            res = a.squeeze().cpu().numpy()
+            if not len(res.shape):
+                res = np.expand_dims(res, 0)
+            return res
+
+
+class LidarFormerQFunction(nn.Module):
+    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU,
+                 d_model=64, nhead=4, num_layers=2, dim_feedforward=128, dropout=0.0):
+        super().__init__()
+        dim_act = action_space.shape[0]
+        hist, rays, n_prev_actions = _lidarformer_dims(observation_space, dim_act)
+        n_scalars = 2 + n_prev_actions * dim_act + dim_act
+        self.lidar_net = LidarFormerEncoder(hist, rays, d_model, nhead, num_layers, dim_feedforward, dropout)
+        self.scalar_net = LidarFormerScalarEncoder(n_scalars, d_model)
+        self.q = mlp([2 * d_model] + list(hidden_sizes) + [1], activation)
+
+    def forward(self, obs, act):
+        speed, progress, lidar, *prev_actions = obs
+        lidar = lidar.float()
+        scalars = torch.cat((speed.float() / 100.0, progress.float(), *[a.float() for a in prev_actions], act.float()), -1)
+        x = torch.cat((self.lidar_net(lidar), self.scalar_net(scalars)), -1)
+        q = self.q(x)
+        return torch.squeeze(q, -1)  # Critical to ensure q has right shape.
+
+
+class LidarFormerActorCritic(nn.Module):
+    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU,
+                 d_model=64, nhead=4, num_layers=2, dim_feedforward=128, dropout=0.0):
+        super().__init__()
+        self.actor = SquashedGaussianLidarFormerActor(
+            observation_space, action_space, hidden_sizes, activation,
+            d_model, nhead, num_layers, dim_feedforward, dropout)
+        self.q1 = LidarFormerQFunction(
+            observation_space, action_space, hidden_sizes, activation,
+            d_model, nhead, num_layers, dim_feedforward, dropout)
+        self.q2 = LidarFormerQFunction(
+            observation_space, action_space, hidden_sizes, activation,
+            d_model, nhead, num_layers, dim_feedforward, dropout)
+
+    def act(self, obs, test=False):
+        with torch.no_grad():
+            a, _ = self.actor(obs, test, False)
+            res = a.squeeze().cpu().numpy()
+            if not len(res.shape):
+                res = np.expand_dims(res, 0)
+            return res
  
